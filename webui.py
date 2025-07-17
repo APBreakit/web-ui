@@ -1,6 +1,4 @@
-import pdb
 import logging
-
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,12 +6,12 @@ import os
 import glob
 import asyncio
 import argparse
-import os
 
 logger = logging.getLogger(__name__)
 
 import gradio as gr
 
+from src.i18n import i18n
 from browser_use.agent.service import Agent
 from playwright.async_api import async_playwright
 from browser_use.browser.browser import Browser, BrowserConfig
@@ -22,7 +20,6 @@ from browser_use.browser.context import (
     BrowserContextWindowSize,
 )
 from langchain_ollama import ChatOllama
-from playwright.async_api import async_playwright
 from src.utils.agent_state import AgentState
 
 from src.utils import utils
@@ -31,7 +28,6 @@ from src.browser.custom_browser import CustomBrowser
 from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
 from src.browser.custom_context import BrowserContextConfig, CustomBrowserContext
 from src.controller.custom_controller import CustomController
-from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
 from src.utils.default_config_settings import default_config, load_config_from_file, save_config_to_file, save_current_config, update_ui_from_config
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot
 
@@ -66,31 +62,6 @@ async def stop_agent():
         logger.error(error_msg)
         return (
             error_msg,
-            gr.update(value="Stop", interactive=True),
-            gr.update(interactive=True)
-        )
-        
-async def stop_research_agent():
-    """Request the agent to stop and update UI with enhanced feedback"""
-    global _global_agent_state, _global_browser_context, _global_browser
-
-    try:
-        # Request stop
-        _global_agent_state.request_stop()
-
-        # Update UI immediately
-        message = "Stop requested - the agent will halt at the next safe point"
-        logger.info(f"🛑 {message}")
-
-        # Return UI updates
-        return (                                   # errors_output
-            gr.update(value="Stopping...", interactive=False),  # stop_button
-            gr.update(interactive=False),                      # run_button
-        )
-    except Exception as e:
-        error_msg = f"Error during stop: {str(e)}"
-        logger.error(error_msg)
-        return (
             gr.update(value="Stop", interactive=True),
             gr.update(interactive=True)
         )
@@ -229,62 +200,100 @@ async def run_browser_agent(
         )
 
 
+async def initialize_browser_and_context(
+    use_own_browser,
+    headless,
+    disable_security,
+    window_w,
+    window_h,
+    save_trace_path,
+    save_recording_path,
+    agent_type,
+):
+    global _global_browser, _global_browser_context
+    extra_chromium_args = [f"--window-size={window_w},{window_h}"]
+    if use_own_browser:
+        chrome_path = os.getenv("CHROME_PATH", None)
+        if chrome_path == "":
+            chrome_path = None
+        chrome_user_data = os.getenv("CHROME_USER_DATA", None)
+        if chrome_user_data:
+            extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
+    else:
+        chrome_path = None
+
+    browser_class = CustomBrowser if agent_type == "custom" else Browser
+    if _global_browser is None:
+        _global_browser = browser_class(
+            config=BrowserConfig(
+                headless=headless,
+                disable_security=disable_security,
+                chrome_instance_path=chrome_path,
+                extra_chromium_args=extra_chromium_args,
+            )
+        )
+
+    if _global_browser_context is None:
+        context_config_class = (
+            CustomBrowserContext if agent_type == "custom" else BrowserContextConfig
+        )
+        _global_browser_context = await _global_browser.new_context(
+            config=context_config_class(
+                trace_path=save_trace_path if save_trace_path else None,
+                save_recording_path=save_recording_path
+                if save_recording_path
+                else None,
+                no_viewport=False,
+                browser_window_size=BrowserContextWindowSize(
+                    width=window_w, height=window_h
+                ),
+            )
+        )
+
+
+async def close_browser_and_context():
+    global _global_browser, _global_browser_context
+    if _global_browser_context:
+        await _global_browser_context.close()
+        _global_browser_context = None
+
+    if _global_browser:
+        await _global_browser.close()
+        _global_browser = None
+
+
 async def run_org_agent(
-        llm,
-        use_own_browser,
-        keep_browser_open,
-        headless,
-        disable_security,
-        window_w,
-        window_h,
-        save_recording_path,
-        save_agent_history_path,
-        save_trace_path,
-        task,
-        max_steps,
-        use_vision,
-        max_actions_per_step,
-        tool_calling_method
+    llm,
+    use_own_browser,
+    keep_browser_open,
+    headless,
+    disable_security,
+    window_w,
+    window_h,
+    save_recording_path,
+    save_agent_history_path,
+    save_trace_path,
+    task,
+    max_steps,
+    use_vision,
+    max_actions_per_step,
+    tool_calling_method,
 ):
     try:
-        global _global_browser, _global_browser_context, _global_agent_state
-        
-        # Clear any previous stop request
+        global _global_agent_state
         _global_agent_state.clear_stop()
 
-        extra_chromium_args = [f"--window-size={window_w},{window_h}"]
-        if use_own_browser:
-            chrome_path = os.getenv("CHROME_PATH", None)
-            if chrome_path == "":
-                chrome_path = None
-            chrome_user_data = os.getenv("CHROME_USER_DATA", None)
-            if chrome_user_data:
-                extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
-        else:
-            chrome_path = None
-            
-        if _global_browser is None:
-            _global_browser = Browser(
-                config=BrowserConfig(
-                    headless=headless,
-                    disable_security=disable_security,
-                    chrome_instance_path=chrome_path,
-                    extra_chromium_args=extra_chromium_args,
-                )
-            )
+        await initialize_browser_and_context(
+            use_own_browser,
+            headless,
+            disable_security,
+            window_w,
+            window_h,
+            save_trace_path,
+            save_recording_path,
+            "org",
+        )
 
-        if _global_browser_context is None:
-            _global_browser_context = await _global_browser.new_context(
-                config=BrowserContextConfig(
-                    trace_path=save_trace_path if save_trace_path else None,
-                    save_recording_path=save_recording_path if save_recording_path else None,
-                    no_viewport=False,
-                    browser_window_size=BrowserContextWindowSize(
-                        width=window_w, height=window_h
-                    ),
-                )
-            )
-            
         agent = Agent(
             task=task,
             llm=llm,
@@ -292,7 +301,7 @@ async def run_org_agent(
             browser=_global_browser,
             browser_context=_global_browser_context,
             max_actions_per_step=max_actions_per_step,
-            tool_calling_method=tool_calling_method
+            tool_calling_method=tool_calling_method,
         )
         history = await agent.run(max_steps=max_steps)
 
@@ -306,84 +315,59 @@ async def run_org_agent(
 
         trace_file = get_latest_files(save_trace_path)
 
-        return final_result, errors, model_actions, model_thoughts, trace_file.get('.zip'), history_file
+        return (
+            final_result,
+            errors,
+            model_actions,
+            model_thoughts,
+            trace_file.get(".zip"),
+            history_file,
+        )
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         errors = str(e) + "\n" + traceback.format_exc()
-        return '', errors, '', '', None, None
+        return "", errors, "", "", None, None
     finally:
-        # Handle cleanup based on persistence configuration
         if not keep_browser_open:
-            if _global_browser_context:
-                await _global_browser_context.close()
-                _global_browser_context = None
+            await close_browser_and_context()
 
-            if _global_browser:
-                await _global_browser.close()
-                _global_browser = None
 
 async def run_custom_agent(
-        llm,
-        use_own_browser,
-        keep_browser_open,
-        headless,
-        disable_security,
-        window_w,
-        window_h,
-        save_recording_path,
-        save_agent_history_path,
-        save_trace_path,
-        task,
-        add_infos,
-        max_steps,
-        use_vision,
-        max_actions_per_step,
-        tool_calling_method
+    llm,
+    use_own_browser,
+    keep_browser_open,
+    headless,
+    disable_security,
+    window_w,
+    window_h,
+    save_recording_path,
+    save_agent_history_path,
+    save_trace_path,
+    task,
+    add_infos,
+    max_steps,
+    use_vision,
+    max_actions_per_step,
+    tool_calling_method,
 ):
     try:
-        global _global_browser, _global_browser_context, _global_agent_state
-
-        # Clear any previous stop request
+        global _global_agent_state
         _global_agent_state.clear_stop()
 
-        extra_chromium_args = [f"--window-size={window_w},{window_h}"]
-        if use_own_browser:
-            chrome_path = os.getenv("CHROME_PATH", None)
-            if chrome_path == "":
-                chrome_path = None
-            chrome_user_data = os.getenv("CHROME_USER_DATA", None)
-            if chrome_user_data:
-                extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
-        else:
-            chrome_path = None
+        await initialize_browser_and_context(
+            use_own_browser,
+            headless,
+            disable_security,
+            window_w,
+            window_h,
+            save_trace_path,
+            save_recording_path,
+            "custom",
+        )
 
         controller = CustomController()
-
-        # Initialize global browser if needed
-        if _global_browser is None:
-            _global_browser = CustomBrowser(
-                config=BrowserConfig(
-                    headless=headless,
-                    disable_security=disable_security,
-                    chrome_instance_path=chrome_path,
-                    extra_chromium_args=extra_chromium_args,
-                )
-            )
-
-        if _global_browser_context is None:
-            _global_browser_context = await _global_browser.new_context(
-                config=BrowserContextConfig(
-                    trace_path=save_trace_path if save_trace_path else None,
-                    save_recording_path=save_recording_path if save_recording_path else None,
-                    no_viewport=False,
-                    browser_window_size=BrowserContextWindowSize(
-                        width=window_w, height=window_h
-                    ),
-                )
-            )
-            
-        # Create and run agent
         agent = CustomAgent(
             task=task,
             add_infos=add_infos,
@@ -396,7 +380,7 @@ async def run_custom_agent(
             agent_prompt_class=CustomAgentMessagePrompt,
             max_actions_per_step=max_actions_per_step,
             agent_state=_global_agent_state,
-            tool_calling_method=tool_calling_method
+            tool_calling_method=tool_calling_method,
         )
         history = await agent.run(max_steps=max_steps)
 
@@ -408,24 +392,26 @@ async def run_custom_agent(
         model_actions = history.model_actions()
         model_thoughts = history.model_thoughts()
 
-        trace_file = get_latest_files(save_trace_path)        
+        trace_file = get_latest_files(save_trace_path)
 
-        return final_result, errors, model_actions, model_thoughts, trace_file.get('.zip'), history_file
+        return (
+            final_result,
+            errors,
+            model_actions,
+            model_thoughts,
+            trace_file.get(".zip"),
+            history_file,
+        )
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         errors = str(e) + "\n" + traceback.format_exc()
-        return '', errors, '', '', None, None
+        return "", errors, "", "", None, None
     finally:
-        # Handle cleanup based on persistence configuration
         if not keep_browser_open:
-            if _global_browser_context:
-                await _global_browser_context.close()
-                _global_browser_context = None
+            await close_browser_and_context()
 
-            if _global_browser:
-                await _global_browser.close()
-                _global_browser = None
 
 async def run_with_stream(
     agent_type,
@@ -480,7 +466,12 @@ async def run_with_stream(
             tool_calling_method=tool_calling_method
         )
         # Add HTML content at the start of the result array
-        html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Using browser...</h1>"
+                html_content = f"""
+        <head>
+            <meta name="description" content="A modern, animated, and SEO-optimized landing page for a construction company.">
+        </head>
+        <h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Using browser...</h1>
+        """
         yield [html_content] + list(result)
     else:
         try:
@@ -513,531 +504,348 @@ async def run_with_stream(
                 )
             )
 
-            # Initialize values for streaming
-            html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Using browser...</h1>"
-            final_result = errors = model_actions = model_thoughts = ""
-            latest_videos = trace = history_file = None
-
-
-            # Periodically update the stream while the agent task is running
+            # Stream screenshots while the agent is running
             while not agent_task.done():
-                try:
-                    encoded_screenshot = await capture_screenshot(_global_browser_context)
-                    if encoded_screenshot is not None:
-                        html_content = f'<img src="data:image/jpeg;base64,{encoded_screenshot}" style="width:{stream_vw}vw; height:{stream_vh}vh ; border:1px solid #ccc;">'
-                    else:
-                        html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Waiting for browser session...</h1>"
-                except Exception as e:
-                    html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Waiting for browser session...</h1>"
-
-                if _global_agent_state and _global_agent_state.is_stop_requested():
-                    yield [
-                        html_content,
-                        final_result,
-                        errors,
-                        model_actions,
-                        model_thoughts,
-                        latest_videos,
-                        trace,
-                        history_file,
-                        gr.update(value="Stopping...", interactive=False),  # stop_button
-                        gr.update(interactive=False),  # run_button
-                    ]
+                if _global_agent_state.is_stopped():
+                    logger.info("Agent stopped, halting screenshot streaming.")
                     break
-                else:
-                    yield [
-                        html_content,
-                        final_result,
-                        errors,
-                        model_actions,
-                        model_thoughts,
-                        latest_videos,
-                        trace,
-                        history_file,
-                        gr.update(value="Stop", interactive=True),  # Re-enable stop button
-                        gr.update(interactive=True)  # Re-enable run button
-                    ]
-                await asyncio.sleep(0.05)
+                screenshot_path = capture_screenshot(_global_browser_context)
+                if screenshot_path:
+                    html_content = f"""
+                    <div style='width:{stream_vw}vw; height:{stream_vh}vh; display: flex; justify-content: center; align-items: center;'>
+                        <img src='file://{screenshot_path}' style='width: 100%; height: 100%; object-fit: contain;'/>
+                    </div>
+                    """
+                    yield [html_content, "", "", "", None, None, None, gr.update(interactive=True), gr.update(interactive=True)]
+                await asyncio.sleep(1)
 
-            # Once the agent task completes, get the results
-            try:
-                result = await agent_task
-                final_result, errors, model_actions, model_thoughts, latest_videos, trace, history_file, stop_button, run_button = result
-            except gr.Error:
-                final_result = ""
-                model_actions = ""
-                model_thoughts = ""
-                latest_videos = trace = history_file = None
-
-            except Exception as e:
-                errors = f"Agent error: {str(e)}"
-
-            yield [
-                html_content,
-                final_result,
-                errors,
-                model_actions,
-                model_thoughts,
-                latest_videos,
-                trace,
-                history_file,
-                stop_button,
-                run_button
-            ]
+            # Get the final result from the agent task
+            result = await agent_task
+            yield [""] + list(result)
 
         except Exception as e:
             import traceback
-            yield [
-                f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Waiting for browser session...</h1>",
-                "",
-                f"Error: {str(e)}\n{traceback.format_exc()}",
-                "",
-                "",
-                None,
-                None,
-                None,
-                gr.update(value="Stop", interactive=True),  # Re-enable stop button
-                gr.update(interactive=True)    # Re-enable run button
-            ]
-
-# Define the theme map globally
-theme_map = {
-    "Default": Default(),
-    "Soft": Soft(),
-    "Monochrome": Monochrome(),
-    "Glass": Glass(),
-    "Origin": Origin(),
-    "Citrus": Citrus(),
-    "Ocean": Ocean(),
-    "Base": Base()
-}
-
-async def close_global_browser():
-    global _global_browser, _global_browser_context
-
-    if _global_browser_context:
-        await _global_browser_context.close()
-        _global_browser_context = None
-
-    if _global_browser:
-        await _global_browser.close()
-        _global_browser = None
-        
-async def run_deep_search(research_task, max_search_iteration_input, max_query_per_iter_input, llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key, use_vision, use_own_browser, headless):
-    from src.utils.deep_research import deep_research
-    global _global_agent_state
-
-    # Clear any previous stop request
-    _global_agent_state.clear_stop()
-    
-    llm = utils.get_llm_model(
-            provider=llm_provider,
-            model_name=llm_model_name,
-            temperature=llm_temperature,
-            base_url=llm_base_url,
-            api_key=llm_api_key,
-        )
-    markdown_content, file_path = await deep_research(research_task, llm, _global_agent_state,
-                                                        max_search_iterations=max_search_iteration_input,
-                                                        max_query_num=max_query_per_iter_input,
-                                                        use_vision=use_vision,
-                                                        headless=headless,
-                                                        use_own_browser=use_own_browser
-                                                        )
-    
-    return markdown_content, file_path, gr.update(value="Stop", interactive=True),  gr.update(interactive=True) 
-    
-
-def create_ui(config, theme_name="Ocean"):
-    css = """
-    .gradio-container {
-        max-width: 1200px !important;
-        margin: auto !important;
-        padding-top: 20px !important;
-    }
-    .header-text {
-        text-align: center;
-        margin-bottom: 30px;
-    }
-    .theme-section {
-        margin-bottom: 20px;
-        padding: 15px;
-        border-radius: 10px;
-    }
-    """
-
+            traceback.print_exc()
+            errors = str(e) + "\n" + traceback.format_exc()
+            yield ["", "", errors, "", "", None, None, None, gr.update(interactive=True), gr.update(interactive=True)]
+   
+def create_ui(config):
     with gr.Blocks(
-            title="Browser Use WebUI", theme=theme_map[theme_name], css=css
+        title="Agent Browser",
+        theme=config.get("theme", "origin"),
+        css=".gradio-container { max-width: 100% !important; }",
     ) as demo:
         with gr.Row():
-            gr.Markdown(
-                """
-                # 🌐 Browser Use WebUI
-                ### Control your browser with AI assistance
-                """,
-                elem_classes=["header-text"],
-            )
-
-        with gr.Tabs() as tabs:
-            with gr.TabItem("⚙️ Agent Settings", id=1):
-                with gr.Group():
-                    agent_type = gr.Radio(
-                        ["org", "custom"],
-                        label="Agent Type",
-                        value=config['agent_type'],
-                        info="Select the type of agent to use",
-                    )
-                    with gr.Column():
-                        max_steps = gr.Slider(
-                            minimum=1,
-                            maximum=200,
-                            value=config['max_steps'],
-                            step=1,
-                            label="Max Run Steps",
-                            info="Maximum number of steps the agent will take",
+            with gr.Column(scale=1):
+                # Left panel for configuration
+                with gr.Accordion("General Settings", open=True):
+                    with gr.Row():
+                        agent_type = gr.Radio(
+                            ["custom", "org"],
+                            value=config.get("agent_type", "custom"),
+                            label="Agent Type",
                         )
-                        max_actions_per_step = gr.Slider(
-                            minimum=1,
-                            maximum=20,
-                            value=config['max_actions_per_step'],
-                            step=1,
-                            label="Max Actions per Step",
-                            info="Maximum number of actions the agent will take per step",
+                        theme_dropdown = gr.Dropdown(
+                            ["origin", "citrus", "default", "glass", "monochrome", "ocean", "soft"],
+                            value=config.get("theme", "origin"),
+                            label="Theme",
                         )
-                    with gr.Column():
-                        use_vision = gr.Checkbox(
-                            label="Use Vision",
-                            value=config['use_vision'],
-                            info="Enable visual processing capabilities",
-                        )
-                        tool_calling_method = gr.Dropdown(
-                            label="Tool Calling Method",
-                            value=config['tool_calling_method'],
-                            interactive=True,
-                            allow_custom_value=True,  # Allow users to input custom model names
-                            choices=["auto", "json_schema", "function_calling"],
-                            info="Tool Calls Funtion Name",
-                            visible=False
-                        )
-
-            with gr.TabItem("🔧 LLM Configuration", id=2):
-                with gr.Group():
+                with gr.Accordion("LLM Settings", open=True):
                     llm_provider = gr.Dropdown(
-                        choices=[provider for provider,model in utils.model_names.items()],
+                        ["Ollama", "OpenAI", "Groq", "Anthropic", "Google", "Mistral"],
+                        value=config.get("llm_provider", "Ollama"),
                         label="LLM Provider",
-                        value=config['llm_provider'],
-                        info="Select your preferred language model provider"
                     )
                     llm_model_name = gr.Dropdown(
-                        label="Model Name",
-                        choices=utils.model_names['openai'],
-                        value=config['llm_model_name'],
+                        update_model_dropdown(config.get("llm_provider", "Ollama")),
+                        value=config.get("llm_model_name", "llama3"),
+                        label="LLM Model",
                         interactive=True,
-                        allow_custom_value=True,  # Allow users to input custom model names
-                        info="Select a model from the dropdown or type a custom model name"
                     )
                     llm_temperature = gr.Slider(
                         minimum=0.0,
                         maximum=2.0,
-                        value=config['llm_temperature'],
                         step=0.1,
-                        label="Temperature",
-                        info="Controls randomness in model outputs"
+                        value=config.get("llm_temperature", 0.7),
+                        label="LLM Temperature",
+                    )
+                    llm_base_url = gr.Textbox(
+                        value=config.get("llm_base_url", "http://localhost:11434"),
+                        label="LLM Base URL (Optional)",
+                    )
+                    llm_api_key = gr.Textbox(
+                        value=config.get("llm_api_key", ""),
+                        label="LLM API Key (Optional)",
+                        type="password",
+                    )
+
+                with gr.Accordion("Browser Settings", open=True):
+                    use_own_browser = gr.Checkbox(
+                        value=config.get("use_own_browser", False),
+                        label="Use own browser (via CHROME_PATH and CHROME_USER_DATA in .env)",
+                    )
+                    keep_browser_open = gr.Checkbox(
+                        value=config.get("keep_browser_open", False),
+                        label="Keep browser open after run",
+                    )
+                    headless = gr.Checkbox(
+                        value=config.get("headless", False),
+                        label="Headless mode",
+                    )
+                    disable_security = gr.Checkbox(
+                        value=config.get("disable_security", False),
+                        label="Disable security measures (use with caution)",
                     )
                     with gr.Row():
-                        llm_base_url = gr.Textbox(
-                            label="Base URL",
-                            value=config['llm_base_url'],
-                            info="API endpoint URL (if required)"
+                        window_w = gr.Slider(
+                            minimum=1024,
+                            maximum=1920,
+                            step=1,
+                            value=config.get("window_w", 1280),
+                            label="Window Width",
                         )
-                        llm_api_key = gr.Textbox(
-                            label="API Key",
-                            type="password",
-                            value=config['llm_api_key'],
-                            info="Your API key (leave blank to use .env)"
+                        window_h = gr.Slider(
+                            minimum=768,
+                            maximum=1080,
+                            step=1,
+                            value=config.get("window_h", 800),
+                            label="Window Height",
                         )
 
-            with gr.TabItem("🌐 Browser Settings", id=3):
-                with gr.Group():
+                with gr.Accordion("Agent Settings", open=True):
+                    max_steps = gr.Slider(
+                        minimum=1,
+                        maximum=50,
+                        step=1,
+                        value=config.get("max_steps", 15),
+                        label="Max Steps",
+                    )
+                    use_vision = gr.Checkbox(
+                        value=config.get("use_vision", False),
+                        label="Use Vision",
+                    )
+                    max_actions_per_step = gr.Slider(
+                        minimum=1,
+                        maximum=5,
+                        step=1,
+                        value=config.get("max_actions_per_step", 1),
+                        label="Max actions per step",
+                    )
+                    tool_calling_method = gr.Radio(
+                        ["tool_calling", "json"],
+                        value=config.get("tool_calling_method", "tool_calling"),
+                        label="Tool Calling Method",
+                    )
+
+                with gr.Accordion("Files Settings", open=True):
                     with gr.Row():
-                        use_own_browser = gr.Checkbox(
-                            label="Use Own Browser",
-                            value=config['use_own_browser'],
-                            info="Use your existing browser instance",
-                        )
-                        keep_browser_open = gr.Checkbox(
-                            label="Keep Browser Open",
-                            value=config['keep_browser_open'],
-                            info="Keep Browser Open between Tasks",
-                        )
-                        headless = gr.Checkbox(
-                            label="Headless Mode",
-                            value=config['headless'],
-                            info="Run browser without GUI",
-                        )
-                        disable_security = gr.Checkbox(
-                            label="Disable Security",
-                            value=config['disable_security'],
-                            info="Disable browser security features",
+                        save_recording_path = gr.Textbox(
+                            value=config.get("save_recording_path", "recordings"),
+                            label="Save Recording Path",
                         )
                         enable_recording = gr.Checkbox(
+                            value=config.get("enable_recording", False),
                             label="Enable Recording",
-                            value=config['enable_recording'],
-                            info="Enable saving browser recordings",
                         )
-
-                    with gr.Row():
-                        window_w = gr.Number(
-                            label="Window Width",
-                            value=config['window_w'],
-                            info="Browser window width",
-                        )
-                        window_h = gr.Number(
-                            label="Window Height",
-                            value=config['window_h'],
-                            info="Browser window height",
-                        )
-
-                    save_recording_path = gr.Textbox(
-                        label="Recording Path",
-                        placeholder="e.g. ./tmp/record_videos",
-                        value=config['save_recording_path'],
-                        info="Path to save browser recordings",
-                        interactive=True,  # Allow editing only if recording is enabled
-                    )
-
-                    save_trace_path = gr.Textbox(
-                        label="Trace Path",
-                        placeholder="e.g. ./tmp/traces",
-                        value=config['save_trace_path'],
-                        info="Path to save Agent traces",
-                        interactive=True,
-                    )
-
                     save_agent_history_path = gr.Textbox(
-                        label="Agent History Save Path",
-                        placeholder="e.g., ./tmp/agent_history",
-                        value=config['save_agent_history_path'],
-                        info="Specify the directory where agent history should be saved.",
+                        value=config.get("save_agent_history_path", "history"),
+                        label="Save Agent History Path",
+                    )
+                    save_trace_path = gr.Textbox(
+                        value=config.get("save_trace_path", "traces"),
+                        label="Save Trace Path",
+                    )
+
+                with gr.Accordion("Configuration", open=True):
+                    with gr.Row():
+                        save_config_button = gr.Button("Save Config")
+                        load_config_button = gr.Button("Load Config")
+                    config_file_dropdown = gr.Dropdown(
+                        choices=utils.get_config_files(),
+                        label="Select Config File",
                         interactive=True,
                     )
 
-            with gr.TabItem("🤖 Run Agent", id=4):
-                task = gr.Textbox(
-                    label="Task Description",
-                    lines=4,
-                    placeholder="Enter your task here...",
-                    value=config['task'],
-                    info="Describe what you want the agent to do",
-                )
-                add_infos = gr.Textbox(
-                    label="Additional Information",
-                    lines=3,
-                    placeholder="Add any helpful context or instructions...",
-                    info="Optional hints to help the LLM complete the task",
-                )
-
-                with gr.Row():
-                    run_button = gr.Button("▶️ Run Agent", variant="primary", scale=2)
-                    stop_button = gr.Button("⏹️ Stop", variant="stop", scale=1)
-                    
-                with gr.Row():
-                    browser_view = gr.HTML(
-                        value="<h1 style='width:80vw; height:50vh'>Waiting for browser session...</h1>",
-                        label="Live Browser View",
-                )
-            
-            with gr.TabItem("🧐 Deep Research", id=5):
-                research_task_input = gr.Textbox(label="Research Task", lines=5, value="Compose a report on the use of Reinforcement Learning for training Large Language Models, encompassing its origins, current advancements, and future prospects, substantiated with examples of relevant models and techniques. The report should reflect original insights and analysis, moving beyond mere summarization of existing literature.")
-                with gr.Row():
-                    max_search_iteration_input = gr.Number(label="Max Search Iteration", value=3, precision=0) # precision=0 确保是整数
-                    max_query_per_iter_input = gr.Number(label="Max Query per Iteration", value=1, precision=0) # precision=0 确保是整数
-                with gr.Row():
-                    research_button = gr.Button("▶️ Run Deep Research", variant="primary", scale=2)
-                    stop_research_button = gr.Button("⏹️ Stop", variant="stop", scale=1)
-                markdown_output_display = gr.Markdown(label="Research Report")
-                markdown_download = gr.File(label="Download Research Report")
-
-
-            with gr.TabItem("📊 Results", id=6):
-                with gr.Group():
-
-                    recording_display = gr.Video(label="Latest Recording")
-
-                    gr.Markdown("### Results")
-                    with gr.Row():
+            with gr.Column(scale=4):
+                with gr.Tabs():
+                    with gr.TabItem("Agent"):
                         with gr.Column():
-                            final_result_output = gr.Textbox(
-                                label="Final Result", lines=3, show_label=True
-                            )
-                        with gr.Column():
-                            errors_output = gr.Textbox(
-                                label="Errors", lines=3, show_label=True
-                            )
-                    with gr.Row():
-                        with gr.Column():
-                            model_actions_output = gr.Textbox(
-                                label="Model Actions", lines=3, show_label=True
-                            )
-                        with gr.Column():
-                            model_thoughts_output = gr.Textbox(
-                                label="Model Thoughts", lines=3, show_label=True
+                            # Main content area
+                            with gr.Row():
+                                task = gr.Textbox(
+                                    label="Task",
+                                    placeholder="Enter the task for the agent",
+                                    lines=1,
+                                    scale=4,
+                                )
+                                run_button = gr.Button("Run", variant="primary")
+                                stop_button = gr.Button("Stop", variant="stop")
+
+                            add_infos = gr.Textbox(
+                                label="Additional Information",
+                                placeholder="Enter additional information for the agent",
+                                lines=3,
                             )
 
-                    trace_file = gr.File(label="Trace File")
+                            # Outputs
+                            with gr.Accordion("Final Result", open=True):
+                                final_result_output = gr.Markdown()
 
-                    agent_history_file = gr.File(label="Agent History")
+                            with gr.Accordion("Screenshots", open=False):
+                                screenshot_output = gr.HTML()
 
-                # Bind the stop button click event after errors_output is defined
-                stop_button.click(
-                    fn=stop_agent,
-                    inputs=[],
-                    outputs=[errors_output, stop_button, run_button],
-                )
+                            with gr.Accordion("Video", open=True):
+                                video_output = gr.Video()
 
-                # Run button click handler
-                run_button.click(
-                    fn=run_with_stream,
-                        inputs=[
-                            agent_type, llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
-                            use_own_browser, keep_browser_open, headless, disable_security, window_w, window_h,
-                            save_recording_path, save_agent_history_path, save_trace_path,  # Include the new path
-                            enable_recording, task, add_infos, max_steps, use_vision, max_actions_per_step, tool_calling_method
-                        ],
-                    outputs=[
-                        browser_view,           # Browser view
-                        final_result_output,    # Final result
-                        errors_output,          # Errors
-                        model_actions_output,   # Model actions
-                        model_thoughts_output,  # Model thoughts
-                        recording_display,      # Latest recording
-                        trace_file,             # Trace file
-                        agent_history_file,     # Agent history file
-                        stop_button,            # Stop button
-                        run_button              # Run button
-                    ],
-                )
-                
-                # Run Deep Research
-                research_button.click(
-                        fn=run_deep_search,
-                        inputs=[research_task_input, max_search_iteration_input, max_query_per_iter_input, llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key, use_vision, use_own_browser, headless],
-                        outputs=[markdown_output_display, markdown_download, stop_research_button, research_button]
-                )
-                # Bind the stop button click event after errors_output is defined
-                stop_research_button.click(
-                    fn=stop_research_agent,
-                    inputs=[],
-                    outputs=[stop_research_button, research_button],
-                )
+                            with gr.Accordion("Errors", open=False):
+                                errors_output = gr.Textbox(label="Errors", lines=5)
 
-            with gr.TabItem("🎥 Recordings", id=7):
-                def list_recordings(save_recording_path):
-                    if not os.path.exists(save_recording_path):
-                        return []
+                            with gr.Accordion("Model Actions", open=False):
+                                model_actions_output = gr.Code(
+                                    label="Model Actions", language="json"
+                                )
 
-                    # Get all video files
-                    recordings = glob.glob(os.path.join(save_recording_path, "*.[mM][pP]4")) + glob.glob(os.path.join(save_recording_path, "*.[wW][eE][bB][mM]"))
+                            with gr.Accordion("Model Thoughts", open=False):
+                                model_thoughts_output = gr.Markdown()
 
-                    # Sort recordings by creation time (oldest first)
-                    recordings.sort(key=os.path.getctime)
+                            with gr.Accordion("Files", open=True):
+                                with gr.Row():
+                                    trace_file_output = gr.File(label="Trace File")
+                                    history_file_output = gr.File(label="History File")
 
-                    # Add numbering to the recordings
-                    numbered_recordings = []
-                    for idx, recording in enumerate(recordings, start=1):
-                        filename = os.path.basename(recording)
-                        numbered_recordings.append((recording, f"{idx}. {filename}"))
-
-                    return numbered_recordings
-
-                recordings_gallery = gr.Gallery(
-                    label="Recordings",
-                    value=list_recordings(config['save_recording_path']),
-                    columns=3,
-                    height="auto",
-                    object_fit="contain"
-                )
-
-                refresh_button = gr.Button("🔄 Refresh Recordings", variant="secondary")
-                refresh_button.click(
-                    fn=list_recordings,
-                    inputs=save_recording_path,
-                    outputs=recordings_gallery
-                )
-            
-            with gr.TabItem("📁 Configuration", id=8):
-                with gr.Group():
-                    config_file_input = gr.File(
-                        label="Load Config File",
-                        file_types=[".pkl"],
-                        interactive=True
-                    )
-
-                    load_config_button = gr.Button("Load Existing Config From File", variant="primary")
-                    save_config_button = gr.Button("Save Current Config", variant="primary")
-
-                    config_status = gr.Textbox(
-                        label="Status",
-                        lines=2,
-                        interactive=False
-                    )
-
-                load_config_button.click(
-                    fn=update_ui_from_config,
-                    inputs=[config_file_input],
-                    outputs=[
-                        agent_type, max_steps, max_actions_per_step, use_vision, tool_calling_method,
-                        llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
-                        use_own_browser, keep_browser_open, headless, disable_security, enable_recording,
-                        window_w, window_h, save_recording_path, save_trace_path, save_agent_history_path,
-                        task, config_status
-                    ]
-                )
-
-                save_config_button.click(
-                    fn=save_current_config,
-                    inputs=[
-                        agent_type, max_steps, max_actions_per_step, use_vision, tool_calling_method,
-                        llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
-                        use_own_browser, keep_browser_open, headless, disable_security,
-                        enable_recording, window_w, window_h, save_recording_path, save_trace_path,
-                        save_agent_history_path, task,
-                    ],  
-                    outputs=[config_status]
-                )
-
-
-        # Attach the callback to the LLM provider dropdown
+        # Event handlers
         llm_provider.change(
-            lambda provider, api_key, base_url: update_model_dropdown(provider, api_key, base_url),
-            inputs=[llm_provider, llm_api_key, llm_base_url],
-            outputs=llm_model_name
+            fn=update_model_dropdown, inputs=llm_provider, outputs=llm_model_name
+        )
+        theme_dropdown.change(
+            fn=None,
+            inputs=theme_dropdown,
+            js="""
+            (theme) => {
+                if (theme) {
+                    const url = new URL(window.location);
+                    url.searchParams.set('__theme', theme);
+                    window.location.href = url.href;
+                }
+            }
+            """,
         )
 
-        # Add this after defining the components
-        enable_recording.change(
-            lambda enabled: gr.update(interactive=enabled),
-            inputs=enable_recording,
-            outputs=save_recording_path
+        # Agent tab run button
+        run_button.click(
+            fn=run_with_stream,
+            inputs=[
+                agent_type,
+                llm_provider,
+                llm_model_name,
+                llm_temperature,
+                llm_base_url,
+                llm_api_key,
+                use_own_browser,
+                keep_browser_open,
+                headless,
+                disable_security,
+                window_w,
+                window_h,
+                save_recording_path,
+                save_agent_history_path,
+                save_trace_path,
+                enable_recording,
+                task,
+                add_infos,
+                max_steps,
+                use_vision,
+                max_actions_per_step,
+                tool_calling_method,
+            ],
+            outputs=[
+                screenshot_output,
+                final_result_output,
+                errors_output,
+                model_actions_output,
+                model_thoughts_output,
+                video_output,
+                trace_file_output,
+                history_file_output,
+                stop_button,
+                run_button,
+            ],
         )
 
-        use_own_browser.change(fn=close_global_browser)
-        keep_browser_open.change(fn=close_global_browser)
+        # Agent tab stop button
+        stop_button.click(
+            fn=stop_agent,
+            inputs=[],
+            outputs=[errors_output, stop_button, run_button],
+        )
+
+        # Configuration management
+        ui_inputs = [
+            agent_type,
+            theme_dropdown,
+            llm_provider,
+            llm_model_name,
+            llm_temperature,
+            llm_base_url,
+            llm_api_key,
+            use_own_browser,
+            keep_browser_open,
+            headless,
+            disable_security,
+            window_w,
+            window_h,
+            max_steps,
+            use_vision,
+            max_actions_per_step,
+            tool_calling_method,
+            save_recording_path,
+            enable_recording,
+            save_agent_history_path,
+            save_trace_path,
+            researcher_provider,
+            researcher_model,
+            researcher_base_url,
+            researcher_api_key,
+            researcher_search_depth,
+            researcher_max_search_results,
+            researcher_max_words,
+            researcher_report_type,
+            user_agent,
+        ]
+
+        save_config_button.click(
+            fn=save_current_config,
+            inputs=ui_inputs,
+            outputs=[config_file_dropdown],
+        )
+
+        load_config_button.click(
+            fn=load_config_from_file,
+            inputs=[config_file_dropdown],
+            outputs=ui_inputs,
+        )
 
     return demo
 
-def main():
-    parser = argparse.ArgumentParser(description="Gradio UI for Browser Agent")
-    parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
-    parser.add_argument("--port", type=int, default=7788, help="Port to listen on")
-    parser.add_argument("--theme", type=str, default="Ocean", choices=theme_map.keys(), help="Theme to use for the UI")
-    parser.add_argument("--dark-mode", action="store_true", help="Enable dark mode")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the Gradio UI for the agent browser")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.json",
+        help="Path to the configuration file",
+    )
     args = parser.parse_args()
 
-    config_dict = default_config()
+    config = default_config
+    if os.path.exists(args.config):
+        config = load_config_from_file(args.config)
 
-    demo = create_ui(config_dict, theme_name=args.theme)
-    demo.launch(server_name=args.ip, server_port=args.port)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
-if __name__ == '__main__':
-    main()
+    demo = create_ui(config)
+    demo.launch()
